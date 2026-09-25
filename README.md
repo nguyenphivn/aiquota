@@ -49,7 +49,7 @@ Make sure `~/.local/bin` is on your `PATH`.
 
 ```sh
 aiquota          # print once
-aiquota -w       # keep it open, redraw every 30 s
+aiquota -w       # keep it open, redraw every 60 s
 aiquota -w 10    # redraw every 10 s
 ```
 
@@ -78,7 +78,7 @@ their credential or config files.
 | Codex    | Starts `codex app-server` and calls `account/rateLimits/read`. `CODEX_API_KEY` is removed from the child environment so the ChatGPT login is used. |
 
 The Claude usage endpoint is rate-limited, so each provider is queried at most
-once every 5 minutes; results are cached in `~/.cache/aiquota/`. Watch mode
+once every 10 minutes; results are cached in `~/.cache/aiquota/`. Watch mode
 redraws more often than that only to move the pace marker and countdowns.
 
 ## Caveats
