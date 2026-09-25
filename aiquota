@@ -1,0 +1,434 @@
+#!/usr/bin/env python3
+"""Show weekly Claude Code / Codex quota with a pace marker.
+
+Usage: aiquota            print once
+       aiquota -w [SEC]   redraw every SEC seconds (default 30)
+
+Language: English by default, Vietnamese when AIQUOTA_LANG=vi
+(or the locale is vi_*).
+
+Read-only: never writes to Claude Code or Codex credential/config files.
+"""
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.request
+from datetime import datetime
+
+WEEK = 7 * 24 * 3600
+FETCH_TTL = 300  # the Claude usage endpoint rate-limits aggressively
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "aiquota")
+
+RESET, DIM, BOLD = "\033[0m", "\033[2m", "\033[1m"
+GREEN, YELLOW, RED, WHITE = "\033[32m", "\033[33m", "\033[31m", "\033[97m"
+
+# Bar gradients from each brand: Claude peach→crail, Codex logo lavender→blue.
+BRANDS = {
+    "Claude": ["#DE7356", "#D97757", "#C15F3C"],
+    "Codex": ["#B1A7FF", "#7A9DFF", "#3941FF"],
+}
+TRACK = "#2A2A2E"  # unused part of the bar, blended toward the brand below
+
+STRINGS = {
+    "en": {
+        "units": ("d", "h", "m"),
+        "on_pace": "● on pace",
+        "ahead": "▲ %.0f%% ahead",
+        "behind": "▼ %.0f%% behind",
+        "exhausted": "used up",
+        "runs_out": "runs out in %s",
+        "lasts": "lasts until reset",
+        "reset": "resets in %s",
+        "stale": "%s old",
+        "no_data": "no data",
+        "http": "server returned %d",
+        "token_expired": "token expired, open Claude Code once to refresh it",
+        "codex_error": "unknown error",
+        "codex_no_week": "no weekly limit found",
+        "codex_silent": "codex did not answer",
+        "footer": " updated %s · Ctrl+C to quit",
+    },
+    "vi": {
+        "units": ("n", "g", "p"),
+        "on_pace": "● đúng nhịp",
+        "ahead": "▲ nhanh %.0f%%",
+        "behind": "▼ chậm %.0f%%",
+        "exhausted": "đã hết",
+        "runs_out": "hết sau %s",
+        "lasts": "đủ tới reset",
+        "reset": "reset %s",
+        "stale": "cũ %s",
+        "no_data": "không lấy được số",
+        "http": "máy chủ trả %d",
+        "token_expired": "token hết hạn, mở Claude Code một lần để làm mới",
+        "codex_error": "lỗi không rõ",
+        "codex_no_week": "không thấy hạn mức tuần",
+        "codex_silent": "codex không trả lời",
+        "footer": " cập nhật %s · Ctrl+C để thoát",
+    },
+}
+
+
+def pick_lang():
+    explicit = os.environ.get("AIQUOTA_LANG", "").lower()
+    if explicit in STRINGS:
+        return explicit
+    for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        if os.environ.get(var, "").lower().startswith("vi"):
+            return "vi"
+    return "en"
+
+
+S = STRINGS[pick_lang()]
+
+
+def hex_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def mix(a, b, t):
+    return tuple(round(x + (y - x) * t) for x, y in zip(a, b))
+
+
+def gradient(stops, t):
+    stops = [hex_rgb(s) for s in stops]
+    if len(stops) == 1:
+        return stops[0]
+    pos = t * (len(stops) - 1)
+    i = min(int(pos), len(stops) - 2)
+    return mix(stops[i], stops[i + 1], pos - i)
+
+
+def fg(rgb):
+    return "\033[38;2;%d;%d;%dm" % rgb
+
+
+def load_cache(name):
+    try:
+        with open(os.path.join(CACHE_DIR, name + ".json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def save_cache(name, data):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    path = os.path.join(CACHE_DIR, name + ".json")
+    with open(path + ".tmp", "w") as f:
+        json.dump(data, f)
+    os.replace(path + ".tmp", path)
+
+
+def iso_to_epoch(s):
+    return datetime.fromisoformat(s).timestamp()
+
+
+def claude_from_api():
+    with open(os.path.expanduser("~/.claude/.credentials.json")) as f:
+        oauth = json.load(f)["claudeAiOauth"]
+    if oauth.get("expiresAt", 0) / 1000 < time.time():
+        raise RuntimeError(S["token_expired"])
+    req = urllib.request.Request(
+        "https://api.anthropic.com/api/oauth/usage",
+        headers={
+            "Authorization": "Bearer " + oauth["accessToken"],
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "aiquota",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        week = json.load(r)["seven_day"]
+    return {
+        "used": float(week["utilization"]),
+        "resets_at": iso_to_epoch(week["resets_at"]),
+        "fetched_at": time.time(),
+        "plan": oauth.get("subscriptionType") or "",
+    }
+
+
+def claude_from_claude_json():
+    # Claude Code keeps its own last-seen utilization here; no network needed.
+    with open(os.path.expanduser("~/.claude.json")) as f:
+        cached = json.load(f)["cachedUsageUtilization"]
+    week = cached["utilization"]["seven_day"]
+    return {
+        "used": float(week["utilization"]),
+        "resets_at": iso_to_epoch(week["resets_at"]),
+        "fetched_at": cached["fetchedAtMs"] / 1000,
+        "plan": "",
+    }
+
+
+def get_claude():
+    cached = load_cache("claude")
+    if cached and time.time() - cached.get("tried_at", 0) < FETCH_TTL:
+        return cached, None
+    try:
+        data = claude_from_api()
+        data["tried_at"] = time.time()
+        save_cache("claude", data)
+        return data, None
+    except urllib.error.HTTPError as e:
+        err = S["http"] % e.code
+    except (OSError, ValueError, KeyError, RuntimeError) as e:
+        err = str(e)
+    # Fall back to whichever snapshot is newer, and back off before retrying.
+    candidates = [c for c in (cached,) if c]
+    try:
+        candidates.append(claude_from_claude_json())
+    except (OSError, ValueError, KeyError):
+        pass
+    if not candidates:
+        return None, err
+    best = max(candidates, key=lambda c: c["fetched_at"])
+    best = dict(best, tried_at=time.time())
+    save_cache("claude", best)
+    return best, err
+
+
+def codex_from_app_server():
+    env = {k: v for k, v in os.environ.items() if k != "CODEX_API_KEY"}  # force the ChatGPT login
+    p = subprocess.Popen(
+        ["codex", "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, text=True, env=env,
+    )
+    try:
+        for msg in (
+            {"method": "initialize", "id": 0,
+             "params": {"clientInfo": {"name": "aiquota", "title": "aiquota", "version": "1"}}},
+            {"method": "initialized"},
+            {"method": "account/rateLimits/read", "id": 1, "params": {}},
+        ):
+            p.stdin.write(json.dumps(msg) + "\n")
+        p.stdin.flush()
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            ready, _, _ = select.select([p.stdout], [], [], 1)
+            if not ready:
+                continue
+            line = p.stdout.readline()
+            if not line:
+                break
+            msg = json.loads(line)
+            if msg.get("id") != 1:
+                continue
+            if "error" in msg:
+                raise RuntimeError(msg["error"].get("message", S["codex_error"]))
+            limits = msg["result"]["rateLimits"]
+            windows = [w for w in (limits.get("primary"), limits.get("secondary")) if w]
+            week = next((w for w in windows if w.get("windowDurationMins") == 10080), None)
+            if week is None:
+                raise RuntimeError(S["codex_no_week"])
+            return {
+                "used": float(week["usedPercent"]),
+                "resets_at": float(week["resetsAt"]),
+                "fetched_at": time.time(),
+                "plan": limits.get("planType") or "",
+            }
+        raise RuntimeError(S["codex_silent"])
+    finally:
+        p.kill()
+        p.wait()
+
+
+def get_codex():
+    cached = load_cache("codex")
+    if cached and time.time() - cached.get("tried_at", 0) < FETCH_TTL:
+        return cached, None
+    try:
+        data = codex_from_app_server()
+        data["tried_at"] = time.time()
+        save_cache("codex", data)
+        return data, None
+    except (OSError, ValueError, KeyError, RuntimeError) as e:
+        if cached:
+            save_cache("codex", dict(cached, tried_at=time.time()))
+        return cached, str(e)
+
+
+def fmt_dur(sec):
+    d_u, h_u, m_u = S["units"]
+    sec = max(0, int(sec))
+    d, rem = divmod(sec, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return "%d%s %d%s" % (d, d_u, h, h_u)
+    if h:
+        return "%d%s %d%s" % (h, h_u, m, m_u)
+    return "%d%s" % (m, m_u)
+
+
+ANSI = re.compile(r"\033\[[0-9;?]*[A-Za-z]")
+
+
+def vis_len(s):
+    """Terminal cell width of s, ignoring ANSI escapes."""
+    n = 0
+    for ch in ANSI.sub("", s):
+        if unicodedata.combining(ch):
+            continue
+        n += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return n
+
+
+def wrap_segments(segments, width, sep=" · "):
+    """Greedy-wrap pre-colored phrases so a line never breaks mid-phrase."""
+    lines, cur = [], ""
+    sep_len = vis_len(sep)
+    for seg in segments:
+        if not cur:
+            cur = seg
+        elif vis_len(cur) + sep_len + vis_len(seg) <= width:
+            cur += DIM + sep + RESET + seg
+        else:
+            lines.append(cur)
+            cur = seg
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def make_bar(stops, used, expected, width):
+    track = hex_rgb(TRACK)
+    fill = round(used / 100 * width)
+    mark = min(width - 1, int(expected / 100 * width))
+    cells = []
+    for i in range(width):
+        shade = gradient(stops, i / max(1, width - 1))
+        if i == mark:
+            cells.append(BOLD + WHITE + ("┃" if i >= fill else "▌") + RESET)
+        elif i < fill:
+            cells.append(fg(shade) + "█" + RESET)
+        else:
+            cells.append(fg(mix(track, shade, 0.25)) + "█" + RESET)
+    return "".join(cells)
+
+
+def card_body(name, data, err, now, inner):
+    """Content lines for one provider, each at most `inner` cells wide."""
+    if data is None:
+        return wrap_segments([RED + S["no_data"] + RESET, DIM + str(err) + RESET], inner)
+
+    used = max(0.0, min(100.0, data["used"]))
+    left = data["resets_at"] - now
+    elapsed = max(0.0, min(1.0, 1 - left / WEEK))
+    expected = elapsed * 100
+    diff = used - expected
+
+    if used >= 90 or diff > 10:
+        color = RED
+    elif diff > 0:
+        color = YELLOW
+    else:
+        color = GREEN
+
+    pct = "%s%s%3.0f%%%s" % (color, BOLD, used, RESET)
+    bar_w = max(8, inner - vis_len(pct) - 1)
+    lines = [make_bar(BRANDS.get(name, ["#AAAAAA"]), used, expected, bar_w) + " " + pct]
+
+    if abs(diff) < 1:
+        pace = S["on_pace"]
+    elif diff > 0:
+        pace = color + S["ahead"] % diff + RESET
+    else:
+        pace = GREEN + S["behind"] % -diff + RESET
+    info = [pace]
+    if used >= 100:
+        info.append(RED + S["exhausted"] + RESET)
+    elif elapsed > 0.02 and used > 0:
+        runout = (100 - used) / (used / (elapsed * WEEK))
+        if runout < left:
+            info.append(RED + S["runs_out"] % fmt_dur(runout) + RESET)
+        else:
+            info.append(GREEN + S["lasts"] + RESET)
+    info.append(S["reset"] % fmt_dur(left))
+    # Only flag data that is clearly stale; the fetch error itself is noise here.
+    age = now - data["fetched_at"]
+    if age > 900:
+        info.append(DIM + S["stale"] % fmt_dur(age) + RESET)
+    lines += wrap_segments(info, inner)
+    return lines
+
+
+def box(title, body, width, border_rgb):
+    """Rounded frame with the title embedded in the top edge."""
+    b = fg(border_rgb)
+    inner = width - 4
+    top_fill = max(0, width - 3 - vis_len(title) - 2)
+    out = [b + "╭─ " + RESET + title + b + " " + "─" * top_fill + "╮" + RESET]
+    for line in body:
+        pad = max(0, inner - vis_len(line))
+        out.append(b + "│" + RESET + " " + line + " " * pad + " " + b + "│" + RESET)
+    out.append(b + "╰" + "─" * (width - 2) + "╯" + RESET)
+    return out
+
+
+def draw(width):
+    now = time.time()
+    width = max(30, min(width, 72))
+    out = []
+    for name, getter in (("Claude", get_claude), ("Codex", get_codex)):
+        data, err = getter()
+        stops = BRANDS.get(name, ["#AAAAAA"])
+        brand = gradient(stops, 0.5)
+        title = fg(brand) + BOLD + name + RESET
+        if data and data.get("plan"):
+            title += DIM + " · " + data["plan"] + RESET
+        border = mix(hex_rgb(TRACK), brand, 0.6)
+        out += box(title, card_body(name, data, err, now, width - 4), width, border)
+    return out
+
+
+def term_width():
+    return shutil.get_terminal_size((80, 24)).columns
+
+
+def watch(interval):
+    resized = {"flag": False}
+    signal.signal(signal.SIGWINCH, lambda *_: resized.update(flag=True))
+    # Alternate screen + hidden cursor, restored on any exit path.
+    sys.stdout.write("\033[?1049h\033[?25l")
+    try:
+        while True:
+            lines = draw(term_width() - 1)
+            lines.append(DIM + S["footer"] % time.strftime("%H:%M:%S") + RESET)
+            sys.stdout.write("\033[H" + "".join(l + "\033[K\n" for l in lines) + "\033[J")
+            sys.stdout.flush()
+            resized["flag"] = False
+            deadline = time.time() + interval
+            while time.time() < deadline and not resized["flag"]:
+                time.sleep(0.2)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\033[?25h\033[?1049l")
+        sys.stdout.flush()
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return
+    if args and args[0] in ("-w", "--watch"):
+        try:
+            interval = int(args[1]) if len(args) > 1 else 30
+        except ValueError:
+            sys.exit("aiquota: interval must be a whole number of seconds")
+        watch(max(1, interval))
+        return
+    print("\n".join(draw(term_width() - 1)))
+
+
+if __name__ == "__main__":
+    main()
