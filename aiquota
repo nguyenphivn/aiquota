@@ -2,7 +2,7 @@
 """Show weekly Claude Code / Codex / Antigravity quota with a pace marker.
 
 Usage: aiquota            print once
-       aiquota -w [SEC]   redraw every SEC seconds (default 30)
+       aiquota -w [SEC]   redraw every SEC seconds (default 60)
 
 Language: English by default, Vietnamese when AIQUOTA_LANG=vi
 (or the locale is vi_*).
@@ -30,7 +30,8 @@ from datetime import datetime
 
 WEEK = 7 * 24 * 3600
 FIVE_HOURS = 5 * 3600
-FETCH_TTL = 300  # the Claude usage endpoint rate-limits aggressively
+# The Claude endpoint rate-limits; 10 min is still ~3% of a 5-hour window.
+FETCH_TTL = 600
 CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "aiquota")
 
 RESET, DIM, BOLD = "\033[0m", "\033[2m", "\033[1m"
@@ -531,7 +532,7 @@ def main():
         return
     if args and args[0] in ("-w", "--watch"):
         try:
-            interval = int(args[1]) if len(args) > 1 else 30
+            interval = int(args[1]) if len(args) > 1 else 60
         except ValueError:
             sys.exit("aiquota: interval must be a whole number of seconds")
         watch(max(1, interval))

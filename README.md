@@ -61,7 +61,7 @@ Make sure `~/.local/bin` is on your `PATH`.
 
 ```sh
 aiquota          # print once
-aiquota -w       # keep it open, redraw every 30 s
+aiquota -w       # keep it open, redraw every 60 s
 aiquota -w 10    # redraw every 10 s
 ```
 
@@ -91,7 +91,7 @@ their credential or config files.
 | Antigravity | `POST https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist` and `:fetchAvailableModels` with the token from `~/.gemini/antigravity-cli/antigravity-oauth-token`. Each model has its own quota; the card shows the agent model with the least left, and names it. |
 
 The Claude usage endpoint is rate-limited, so each provider is queried at most
-once every 5 minutes; results are cached in `~/.cache/aiquota/`. Watch mode
+once every 10 minutes; results are cached in `~/.cache/aiquota/`. Watch mode
 redraws more often than that only to move the pace marker and countdowns.
 
 ## Caveats
