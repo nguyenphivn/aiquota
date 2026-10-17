@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Show weekly Claude Code / Codex / Antigravity quota with a pace marker.
+"""Show weekly Claude Code / Codex quota with a pace marker.
 
 Usage: aiquota            print once
        aiquota -w [SEC]   redraw every SEC seconds (default 60)
@@ -10,8 +10,7 @@ Language: English by default, Vietnamese when AIQUOTA_LANG=vi
 Extra Claude Code profiles in ~/.claude-*/ (CLAUDE_CONFIG_DIR) get their
 own card.
 
-Read-only: never writes to Claude Code, Codex or Antigravity credential/config
-files.
+Read-only: never writes to Claude Code or Codex credential/config files.
 """
 import glob
 import json
@@ -37,15 +36,10 @@ CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/
 RESET, DIM, BOLD = "\033[0m", "\033[2m", "\033[1m"
 GREEN, YELLOW, RED, WHITE = "\033[32m", "\033[33m", "\033[31m", "\033[97m"
 
-ANTIGRAVITY_TOKEN = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
-CLOUDCODE = "https://cloudcode-pa.googleapis.com/v1internal:"
-
-# Bar gradients from each brand: Claude peach→crail, Codex logo lavender→blue,
-# Antigravity Gemini blue→violet→rose.
+# Bar gradients from each brand: Claude peach→crail, Codex logo lavender→blue.
 BRANDS = {
     "Claude": ["#DE7356", "#D97757", "#C15F3C"],
     "Codex": ["#B1A7FF", "#7A9DFF", "#3941FF"],
-    "Antigravity": ["#4285F4", "#9B72CB", "#D96570"],
 }
 TRACK = "#2A2A2E"  # unused part of the bar, blended toward the brand below
 
@@ -67,8 +61,6 @@ STRINGS = {
         "codex_no_week": "no weekly limit found",
         "codex_silent": "codex did not answer",
         "five_hour": "5h window",
-        "ag_token_expired": "token expired, open Antigravity once to refresh it",
-        "ag_no_quota": "no model quota found",
         "footer": " updated %s · Ctrl+C to quit",
     },
     "vi": {
@@ -88,8 +80,6 @@ STRINGS = {
         "codex_no_week": "không thấy hạn mức tuần",
         "codex_silent": "codex không trả lời",
         "five_hour": "khung 5g",
-        "ag_token_expired": "token hết hạn, mở Antigravity một lần để làm mới",
-        "ag_no_quota": "không thấy hạn mức model",
         "footer": " cập nhật %s · Ctrl+C để thoát",
     },
 }
@@ -273,60 +263,6 @@ def codex_from_app_server():
         p.wait()
 
 
-def cloudcode_call(token, method, body):
-    req = urllib.request.Request(
-        CLOUDCODE + method, data=json.dumps(body).encode(), method="POST",
-        headers={
-            "Authorization": "Bearer " + token,
-            "Content-Type": "application/json",
-            # The server answers by client: other user agents get "unsupported client".
-            "User-Agent": "antigravity",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return json.load(r)
-
-
-def antigravity_from_api():
-    with open(ANTIGRAVITY_TOKEN) as f:
-        token = json.load(f)["token"]
-    # Go writes nanoseconds; older Pythons only parse up to microseconds.
-    expiry = re.sub(r"(\.\d{6})\d+", r"\1", token["expiry"])
-    if iso_to_epoch(expiry) < time.time():
-        raise RuntimeError(S["ag_token_expired"])
-    access = token["access_token"]
-    assist = cloudcode_call(access, "loadCodeAssist", {"metadata": {
-        "ideType": "ANTIGRAVITY", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"}})
-    project = assist.get("cloudaicompanionProject")
-    found = cloudcode_call(access, "fetchAvailableModels", {"project": project} if project else {})
-    models = found.get("models", {})
-    # Agent models offered in the picker; tab-completion models have no reset time.
-    ids = [i for sort in found.get("agentModelSorts", []) for g in sort.get("groups", [])
-           for i in g.get("modelIds", [])] or list(models)
-    default = found.get("defaultAgentModelId")
-    best = None
-    for mid in ids:
-        quota = models.get(mid, {}).get("quotaInfo") or {}
-        if "resetTime" not in quota:
-            continue
-        # remainingFraction is omitted once a model is used up.
-        left = float(quota.get("remainingFraction", 0))
-        key = (left, mid != default)
-        if best is None or key < best[0]:
-            best = (key, mid, quota)
-    if best is None:
-        raise RuntimeError(S["ag_no_quota"])
-    _, mid, quota = best
-    tier = assist.get("paidTier") or assist.get("currentTier") or {}
-    return {
-        "used": (1 - float(quota.get("remainingFraction", 0))) * 100,
-        "resets_at": iso_to_epoch(quota["resetTime"].replace("Z", "+00:00")),
-        "fetched_at": time.time(),
-        "plan": tier.get("id") or "",
-        "note": models[mid].get("displayName") or mid,
-    }
-
-
 def get_cached(name, fetch):
     cached = load_cache(name)
     if cached and time.time() - cached.get("tried_at", 0) < FETCH_TTL:
@@ -347,10 +283,6 @@ def get_cached(name, fetch):
 
 def get_codex():
     return get_cached("codex", codex_from_app_server)
-
-
-def get_antigravity():
-    return get_cached("antigravity", antigravity_from_api)
 
 
 def fmt_dur(sec):
@@ -453,8 +385,6 @@ def card_body(name, data, err, now, inner):
     info.append(S["reset"] % fmt_dur(left))
     if window == FIVE_HOURS:
         info.append(DIM + S["five_hour"] + RESET)
-    if data.get("note"):
-        info.append(DIM + data["note"] + RESET)
     # Only flag data that is clearly stale; the fetch error itself is noise here.
     age = now - data["fetched_at"]
     if age > 900:
@@ -483,8 +413,6 @@ def draw(width):
     cards = [("Claude", label, lambda p=p: get_claude(*p))
              for label, *p in claude_profiles()]
     cards.append(("Codex", "", get_codex))
-    if os.path.exists(ANTIGRAVITY_TOKEN):
-        cards.append(("Antigravity", "", get_antigravity))
     for name, label, getter in cards:
         data, err = getter()
         stops = BRANDS.get(name, ["#AAAAAA"])
