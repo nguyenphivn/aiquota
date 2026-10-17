@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Show weekly Claude Code / Codex quota with a pace marker.
+"""Show weekly Claude Code / Codex / Antigravity quota with a pace marker.
 
 Usage: aiquota            print once
        aiquota -w [SEC]   redraw every SEC seconds (default 60)
@@ -7,8 +7,13 @@ Usage: aiquota            print once
 Language: English by default, Vietnamese when AIQUOTA_LANG=vi
 (or the locale is vi_*).
 
-Read-only: never writes to Claude Code or Codex credential/config files.
+Extra Claude Code profiles in ~/.claude-*/ (CLAUDE_CONFIG_DIR) get their
+own card.
+
+Read-only: never writes to Claude Code, Codex or Antigravity credential/config
+files.
 """
+import glob
 import json
 import os
 import re
@@ -24,16 +29,23 @@ import urllib.request
 from datetime import datetime
 
 WEEK = 7 * 24 * 3600
-FETCH_TTL = 600  # weekly usage moves ~1% per 100 min; the Claude endpoint rate-limits
+FIVE_HOURS = 5 * 3600
+# The Claude endpoint rate-limits; 10 min is still ~3% of a 5-hour window.
+FETCH_TTL = 600
 CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "aiquota")
 
 RESET, DIM, BOLD = "\033[0m", "\033[2m", "\033[1m"
 GREEN, YELLOW, RED, WHITE = "\033[32m", "\033[33m", "\033[31m", "\033[97m"
 
-# Bar gradients from each brand: Claude peach→crail, Codex logo lavender→blue.
+ANTIGRAVITY_TOKEN = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
+CLOUDCODE = "https://cloudcode-pa.googleapis.com/v1internal:"
+
+# Bar gradients from each brand: Claude peach→crail, Codex logo lavender→blue,
+# Antigravity Gemini blue→violet→rose.
 BRANDS = {
     "Claude": ["#DE7356", "#D97757", "#C15F3C"],
     "Codex": ["#B1A7FF", "#7A9DFF", "#3941FF"],
+    "Antigravity": ["#4285F4", "#9B72CB", "#D96570"],
 }
 TRACK = "#2A2A2E"  # unused part of the bar, blended toward the brand below
 
@@ -54,6 +66,9 @@ STRINGS = {
         "codex_error": "unknown error",
         "codex_no_week": "no weekly limit found",
         "codex_silent": "codex did not answer",
+        "five_hour": "5h window",
+        "ag_token_expired": "token expired, open Antigravity once to refresh it",
+        "ag_no_quota": "no model quota found",
         "footer": " updated %s · Ctrl+C to quit",
     },
     "vi": {
@@ -72,6 +87,9 @@ STRINGS = {
         "codex_error": "lỗi không rõ",
         "codex_no_week": "không thấy hạn mức tuần",
         "codex_silent": "codex không trả lời",
+        "five_hour": "khung 5g",
+        "ag_token_expired": "token hết hạn, mở Antigravity một lần để làm mới",
+        "ag_no_quota": "không thấy hạn mức model",
         "footer": " cập nhật %s · Ctrl+C để thoát",
     },
 }
@@ -132,8 +150,20 @@ def iso_to_epoch(s):
     return datetime.fromisoformat(s).timestamp()
 
 
-def claude_from_api():
-    with open(os.path.expanduser("~/.claude/.credentials.json")) as f:
+def claude_profiles():
+    """(label, config dir, .claude.json path, cache name) per signed-in profile."""
+    home = os.path.expanduser("~")
+    profiles = [("", os.path.join(home, ".claude"), os.path.join(home, ".claude.json"), "claude")]
+    # Profiles run with CLAUDE_CONFIG_DIR=~/.claude-<label> keep .claude.json inside the dir.
+    for d in sorted(glob.glob(os.path.join(home, ".claude-*"))):
+        label = os.path.basename(d)[len(".claude-"):]
+        if os.path.isfile(os.path.join(d, ".credentials.json")) and re.fullmatch(r"[\w.-]+", label):
+            profiles.append((label, d, os.path.join(d, ".claude.json"), "claude-" + label))
+    return profiles
+
+
+def claude_from_api(config_dir):
+    with open(os.path.join(config_dir, ".credentials.json")) as f:
         oauth = json.load(f)["claudeAiOauth"]
     if oauth.get("expiresAt", 0) / 1000 < time.time():
         raise RuntimeError(S["token_expired"])
@@ -146,52 +176,55 @@ def claude_from_api():
         },
     )
     with urllib.request.urlopen(req, timeout=10) as r:
-        week = json.load(r)["seven_day"]
-    return {
-        "used": float(week["utilization"]),
-        "resets_at": iso_to_epoch(week["resets_at"]),
-        "fetched_at": time.time(),
-        "plan": oauth.get("subscriptionType") or "",
-    }
+        data = claude_window(json.load(r), time.time())
+    return dict(data, fetched_at=time.time(), plan=oauth.get("subscriptionType") or "")
 
 
-def claude_from_claude_json():
+def claude_window(usage, fetched_at):
+    week = usage.get("seven_day")
+    if week:
+        return {"used": float(week["utilization"]), "resets_at": iso_to_epoch(week["resets_at"])}
+    # Team plans have no overall weekly cap, only the rolling 5-hour session.
+    session = usage.get("five_hour") or {}
+    if not session.get("resets_at"):
+        # No session running yet: a fresh window would start now.
+        return {"used": 0.0, "resets_at": fetched_at + FIVE_HOURS, "window": FIVE_HOURS}
+    return {"used": float(session["utilization"]), "resets_at": iso_to_epoch(session["resets_at"]),
+            "window": FIVE_HOURS}
+
+
+def claude_from_claude_json(path):
     # Claude Code keeps its own last-seen utilization here; no network needed.
-    with open(os.path.expanduser("~/.claude.json")) as f:
+    with open(path) as f:
         cached = json.load(f)["cachedUsageUtilization"]
-    week = cached["utilization"]["seven_day"]
-    return {
-        "used": float(week["utilization"]),
-        "resets_at": iso_to_epoch(week["resets_at"]),
-        "fetched_at": cached["fetchedAtMs"] / 1000,
-        "plan": "",
-    }
+    fetched_at = cached["fetchedAtMs"] / 1000
+    return dict(claude_window(cached["utilization"], fetched_at), fetched_at=fetched_at, plan="")
 
 
-def get_claude():
-    cached = load_cache("claude")
+def get_claude(config_dir, claude_json, cache):
+    cached = load_cache(cache)
     if cached and time.time() - cached.get("tried_at", 0) < FETCH_TTL:
         return cached, None
     try:
-        data = claude_from_api()
+        data = claude_from_api(config_dir)
         data["tried_at"] = time.time()
-        save_cache("claude", data)
+        save_cache(cache, data)
         return data, None
     except urllib.error.HTTPError as e:
         err = S["http"] % e.code
-    except (OSError, ValueError, KeyError, RuntimeError) as e:
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as e:
         err = str(e)
     # Fall back to whichever snapshot is newer, and back off before retrying.
     candidates = [c for c in (cached,) if c]
     try:
-        candidates.append(claude_from_claude_json())
-    except (OSError, ValueError, KeyError):
+        candidates.append(claude_from_claude_json(claude_json))
+    except (OSError, ValueError, KeyError, TypeError):
         pass
     if not candidates:
         return None, err
     best = max(candidates, key=lambda c: c["fetched_at"])
     best = dict(best, tried_at=time.time())
-    save_cache("claude", best)
+    save_cache(cache, best)
     return best, err
 
 
@@ -240,19 +273,84 @@ def codex_from_app_server():
         p.wait()
 
 
-def get_codex():
-    cached = load_cache("codex")
+def cloudcode_call(token, method, body):
+    req = urllib.request.Request(
+        CLOUDCODE + method, data=json.dumps(body).encode(), method="POST",
+        headers={
+            "Authorization": "Bearer " + token,
+            "Content-Type": "application/json",
+            # The server answers by client: other user agents get "unsupported client".
+            "User-Agent": "antigravity",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.load(r)
+
+
+def antigravity_from_api():
+    with open(ANTIGRAVITY_TOKEN) as f:
+        token = json.load(f)["token"]
+    # Go writes nanoseconds; older Pythons only parse up to microseconds.
+    expiry = re.sub(r"(\.\d{6})\d+", r"\1", token["expiry"])
+    if iso_to_epoch(expiry) < time.time():
+        raise RuntimeError(S["ag_token_expired"])
+    access = token["access_token"]
+    assist = cloudcode_call(access, "loadCodeAssist", {"metadata": {
+        "ideType": "ANTIGRAVITY", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"}})
+    project = assist.get("cloudaicompanionProject")
+    found = cloudcode_call(access, "fetchAvailableModels", {"project": project} if project else {})
+    models = found.get("models", {})
+    # Agent models offered in the picker; tab-completion models have no reset time.
+    ids = [i for sort in found.get("agentModelSorts", []) for g in sort.get("groups", [])
+           for i in g.get("modelIds", [])] or list(models)
+    default = found.get("defaultAgentModelId")
+    best = None
+    for mid in ids:
+        quota = models.get(mid, {}).get("quotaInfo") or {}
+        if "resetTime" not in quota:
+            continue
+        # remainingFraction is omitted once a model is used up.
+        left = float(quota.get("remainingFraction", 0))
+        key = (left, mid != default)
+        if best is None or key < best[0]:
+            best = (key, mid, quota)
+    if best is None:
+        raise RuntimeError(S["ag_no_quota"])
+    _, mid, quota = best
+    tier = assist.get("paidTier") or assist.get("currentTier") or {}
+    return {
+        "used": (1 - float(quota.get("remainingFraction", 0))) * 100,
+        "resets_at": iso_to_epoch(quota["resetTime"].replace("Z", "+00:00")),
+        "fetched_at": time.time(),
+        "plan": tier.get("id") or "",
+        "note": models[mid].get("displayName") or mid,
+    }
+
+
+def get_cached(name, fetch):
+    cached = load_cache(name)
     if cached and time.time() - cached.get("tried_at", 0) < FETCH_TTL:
         return cached, None
     try:
-        data = codex_from_app_server()
+        data = fetch()
         data["tried_at"] = time.time()
-        save_cache("codex", data)
+        save_cache(name, data)
         return data, None
-    except (OSError, ValueError, KeyError, RuntimeError) as e:
-        if cached:
-            save_cache("codex", dict(cached, tried_at=time.time()))
-        return cached, str(e)
+    except urllib.error.HTTPError as e:
+        err = S["http"] % e.code
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as e:
+        err = str(e)
+    if cached:
+        save_cache(name, dict(cached, tried_at=time.time()))
+    return cached, err
+
+
+def get_codex():
+    return get_cached("codex", codex_from_app_server)
+
+
+def get_antigravity():
+    return get_cached("antigravity", antigravity_from_api)
 
 
 def fmt_dur(sec):
@@ -321,7 +419,8 @@ def card_body(name, data, err, now, inner):
 
     used = max(0.0, min(100.0, data["used"]))
     left = data["resets_at"] - now
-    elapsed = max(0.0, min(1.0, 1 - left / WEEK))
+    window = data.get("window", WEEK)
+    elapsed = max(0.0, min(1.0, 1 - left / window))
     expected = elapsed * 100
     diff = used - expected
 
@@ -346,12 +445,16 @@ def card_body(name, data, err, now, inner):
     if used >= 100:
         info.append(RED + S["exhausted"] + RESET)
     elif elapsed > 0.02 and used > 0:
-        runout = (100 - used) / (used / (elapsed * WEEK))
+        runout = (100 - used) / (used / (elapsed * window))
         if runout < left:
             info.append(RED + S["runs_out"] % fmt_dur(runout) + RESET)
         else:
             info.append(GREEN + S["lasts"] + RESET)
     info.append(S["reset"] % fmt_dur(left))
+    if window == FIVE_HOURS:
+        info.append(DIM + S["five_hour"] + RESET)
+    if data.get("note"):
+        info.append(DIM + data["note"] + RESET)
     # Only flag data that is clearly stale; the fetch error itself is noise here.
     age = now - data["fetched_at"]
     if age > 900:
@@ -377,11 +480,18 @@ def draw(width):
     now = time.time()
     width = max(30, min(width, 72))
     out = []
-    for name, getter in (("Claude", get_claude), ("Codex", get_codex)):
+    cards = [("Claude", label, lambda p=p: get_claude(*p))
+             for label, *p in claude_profiles()]
+    cards.append(("Codex", "", get_codex))
+    if os.path.exists(ANTIGRAVITY_TOKEN):
+        cards.append(("Antigravity", "", get_antigravity))
+    for name, label, getter in cards:
         data, err = getter()
         stops = BRANDS.get(name, ["#AAAAAA"])
         brand = gradient(stops, 0.5)
         title = fg(brand) + BOLD + name + RESET
+        if label:
+            title += fg(brand) + " " + label + RESET
         if data and data.get("plan"):
             title += DIM + " · " + data["plan"] + RESET
         border = mix(hex_rgb(TRACK), brand, 0.6)
